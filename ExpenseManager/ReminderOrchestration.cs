@@ -19,54 +19,60 @@ namespace Assistant
     {
         private const string ReminderCreatedEvent = "ReminderCreatedEvent";
 
+        private class State{
+            public State()
+            {
+                Reminders = new List<Reminder>();
+            }
+
+            public List<Reminder> Reminders { get; set; }
+            public DateTime LastTriggerTime { get; set; }
+        }
+
         [FunctionName("ReminderOrchestration")]
         public static async Task RunOrchestrator(
             [OrchestrationTrigger] IDurableOrchestrationContext context)
         {
-            var reminders = new List<Reminder>();
+            var state = context.GetInput<State>() ?? new State{
+                LastTriggerTime = context.CurrentUtcDateTime
+            };
+
             var cancellationTokenSource = new CancellationTokenSource();
-            var timerTask = CreateReminderTimer(context, cancellationTokenSource.Token);
+            var nextReminderMailTime = state.LastTriggerTime.AddTime(1);
+            var timerTask = context.CreateTimer(nextReminderMailTime, cancellationTokenSource.Token);
             var newReminderTask = context.WaitForExternalEvent<Reminder>(ReminderCreatedEvent);
 
-            while (true)
+           var completedTask = await Task.WhenAny(timerTask, newReminderTask);
+            if (completedTask == timerTask)
             {
-                var completedTask = await Task.WhenAny(timerTask, newReminderTask);
-                if (completedTask == timerTask)
-                {
-                    var remindersToSend = reminders.Where(r => r.NextRun <= context.CurrentUtcDateTime).ToArray();
-                    await context.CallActivityAsync<string>("ReminderOrchestration_SendReminder", remindersToSend);
-                    foreach(var reminder in remindersToSend){
-                        if(!reminder.RepeatCount.HasValue){
-                            reminder.RepeatCount--;
-                        }
-                        
-                        if(reminder.RepeatCount.HasValue && reminder.RepeatCount > 0){
-                            reminder.NextRun = context.CurrentUtcDateTime.AddTime(reminder.RepeatAfterNumberOfDays);
-                        }else{
-                            reminders.Remove(reminder);
-                        }
+                var remindersToSend = state.Reminders.Where(r => r.NextRun <= context.CurrentUtcDateTime).ToArray();
+                await context.CallActivityAsync<string>("ReminderOrchestration_SendReminder", remindersToSend);
+                foreach(var reminder in remindersToSend){
+                    if(!reminder.RepeatCount.HasValue){
+                        reminder.RepeatCount--;
                     }
-                    timerTask = CreateReminderTimer(context, cancellationTokenSource.Token);
+                    
+                    if(reminder.RepeatCount.HasValue && reminder.RepeatCount > 0){
+                        reminder.NextRun = context.CurrentUtcDateTime.AddTime(reminder.RepeatAfterNumberOfDays);
+                    }else{
+                        state.Reminders.Remove(reminder);
+                    }
                 }
-                else
-                {
-                    var reminder = newReminderTask.Result;
-                    reminder.NextRun = context.CurrentUtcDateTime.AddTime(reminder.RepeatAfterNumberOfDays);
-                    reminders.Add(reminder);
-                    newReminderTask = context.WaitForExternalEvent<Reminder>(ReminderCreatedEvent);
-                }
+                state.LastTriggerTime = context.CurrentUtcDateTime;
             }
-        }
+            else
+            {
+                var reminder = newReminderTask.Result;
+                reminder.NextRun = context.CurrentUtcDateTime.AddTime(reminder.RepeatAfterNumberOfDays);
+                state.Reminders.Add(reminder);
+            }
 
-        private static Task CreateReminderTimer(IDurableOrchestrationContext context, CancellationToken cancellationToken)
-        {
-            var nextReminderMailTime = context.CurrentUtcDateTime.AddTime(1);
-            return context.CreateTimer(nextReminderMailTime, cancellationToken);
+            context.ContinueAsNew(state);
         }
 
         private static DateTime AddTime(this DateTime date, int days){
             #if DEBUG
-            return date.AddSeconds(days * 10);
+            return date.AddSeconds(days * 15);
             #else
             return date.AddDays(days);
             #endif
